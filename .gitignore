@@ -1,0 +1,21 @@
+node_modules/
+.expo/
+dist/
+web-build/
+*.log
+.DS_Store
+ios/
+android/
+apk/
+.idea/
+*.apk
+*.aab
+
+# Local API configuration — never commit real hosts or keys
+.env
+.env.local
+
+Dev/**
+
+load-test/**
+Test/**
