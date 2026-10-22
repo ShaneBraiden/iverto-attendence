@@ -9,6 +9,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { router } from 'expo-router';
 import { ApiError, getMe, Me, toMe } from '@/lib/api';
 import { signInWithPassword, signOut as supabaseSignOut } from '@/lib/api/supabase';
+import { unregisterForPush } from '@/lib/push';
 import {
   clearSession,
   getAccessToken,
@@ -73,6 +74,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   if (me) last.current = me;
 
   const endSession = useCallback(async () => {
+    /* Before the tokens go: withdrawing the push token is an authenticated call. */
+    await unregisterForPush();
     await clearSession();
     setMe(null);
   }, []);
@@ -104,7 +107,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [endSession]);
 
-  useEffect(() => onSessionExpired(() => setMe(null)), []);
+  /* The tokens are already gone here, so the push token can only be dropped on the device. */
+  useEffect(
+    () =>
+      onSessionExpired(() => {
+        setMe(null);
+        unregisterForPush();
+      }),
+    [],
+  );
 
   const signIn = useCallback(async (email: string, password: string) => {
     const session = await signInWithPassword(email.trim(), password);
@@ -131,6 +142,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signOut = useCallback(async () => {
     const token = getAccessToken();
+    /* Ahead of the Supabase sign-out, while the session can still make the call. */
+    await unregisterForPush();
     /* Best effort: a phone with no signal still gets signed out of the handset. */
     if (token) await supabaseSignOut(token).catch(() => {});
     await endSession();

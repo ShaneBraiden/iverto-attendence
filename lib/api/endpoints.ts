@@ -11,7 +11,7 @@
  * "cursor-paginated" without a body, so those are read tolerantly — `items` or
  * `data`, `startDate` or `from` — into the app's own `Req` / `TeamDayRow`.
  */
-import { get, post } from './http';
+import { del, get, post } from './http';
 import { MAX_UPLOAD_BYTES, UPLOAD_TIMEOUT_MS } from './config';
 import { ApiError } from './errors';
 import type {
@@ -165,6 +165,16 @@ export const getMe = async () => toMe(await get<unknown>(`${M}/me`));
 
 export const changePassword = (currentPassword: string, newPassword: string) =>
   post<{ status: string; message: string }>(`${M}/password`, { currentPassword, newPassword });
+
+/* ----------------------------------------------------------- Push devices */
+
+/** The device's raw FCM registration token (§3.1) — the server sends with `firebase-admin`. */
+export const registerPushDevice = (token: string, platform: 'android' | 'ios') =>
+  post<{ status: string }>(`${M}/push-devices`, { token, platform });
+
+/** §3.2. Sign-out waits on this, so it takes a shorter timeout than the default. */
+export const unregisterPushDevice = (token: string, timeoutMs?: number) =>
+  del<unknown>(`${M}/push-devices/${encodeURIComponent(token)}`, { timeoutMs });
 
 /* ---------------------------------------------------------- Notifications */
 

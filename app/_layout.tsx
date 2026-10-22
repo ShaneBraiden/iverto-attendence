@@ -15,6 +15,7 @@ import { Poppins_600SemiBold } from '@expo-google-fonts/poppins/600SemiBold';
 import { Poppins_700Bold } from '@expo-google-fonts/poppins/700Bold';
 import { colors } from '@/theme';
 import { AuthProvider, isManager, useAuth } from '@/lib/auth';
+import { usePush } from '@/lib/push';
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -46,8 +47,9 @@ function Routes() {
   useEffect(() => {
     if (ready) SplashScreen.hideAsync().catch(() => {});
   }, [ready]);
-  if (!ready) return null;
   const signedIn = !!me && !me.mustChangePassword;
+  usePush(signedIn ? me.userId : null, isManager(me));
+  if (!ready) return null;
 
   return (
     <Stack

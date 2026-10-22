@@ -15,6 +15,10 @@ apk/
 .env
 .env.local
 
+# Firebase project config — see app.config.js
+google-services.json
+GoogleService-Info.plist
+
 Dev/**
 
 load-test/**

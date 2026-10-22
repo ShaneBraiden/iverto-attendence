@@ -2,7 +2,7 @@
   "expo": {
     "name": "Iverto Attendance",
     "slug": "iverto-attendance",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "orientation": "portrait",
     "scheme": "ivertoattendance",
     "userInterfaceStyle": "light",
@@ -22,7 +22,7 @@
     },
     "android": {
       "package": "com.iverto.attendance",
-      "versionCode": 2,
+      "versionCode": 3,
       "softwareKeyboardLayoutMode": "resize",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": true,
@@ -69,6 +69,14 @@
       ],
       "./plugins/with-android-release",
       "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#B9000E",
+          "defaultChannel": "default"
+        }
+      ],
       [
         "expo-location",
         {

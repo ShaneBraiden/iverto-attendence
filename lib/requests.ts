@@ -1,7 +1,7 @@
 /**
  * Labels and rules for leave, correction and remote-work requests.
  */
-import type { Me, Req, RequestKind } from '@/lib/api';
+import type { AppNotification, Me, Req, RequestKind } from '@/lib/api';
 import { daysBetween, daysLabel, rangeLabel, shortDay, timeLabel, todayIso } from '@/lib/format';
 
 export const KIND_LABEL: Record<RequestKind, string> = { LEAVE: 'Leave', CORRECTION: 'Correction', REMOTE: 'Remote work' };
@@ -78,4 +78,19 @@ export function kindOfNotification(type: string | null | undefined): RequestKind
 /** Whether a notification is a manager being asked to act, rather than an outcome. */
 export function isApprovalPrompt(type: string) {
   return /(REQUESTED|SUBMITTED|PENDING|NEW|APPROVAL)/i.test(type) && !/(APPROVED|REJECTED|CANCELLED)$/i.test(type);
+}
+
+/**
+ * Where opening a notification goes — an inbox row or a tapped push, which
+ * carry the same `type` and `data` — or null if it is informational only.
+ */
+export function notificationTarget(n: Pick<AppNotification, 'type' | 'data'>, manager: boolean) {
+  const kind = kindOfNotification(n.type);
+  const id = n.data && typeof n.data.id === 'string' ? n.data.id : null;
+  if (kind && id) {
+    return `/request/${id}?kind=${kind}${manager && isApprovalPrompt(n.type) ? '&role=manager' : ''}`;
+  }
+  const date = n.data && typeof n.data.date === 'string' ? n.data.date : null;
+  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) return `/day/${date}`;
+  return null;
 }

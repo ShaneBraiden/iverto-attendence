@@ -213,7 +213,8 @@ export const get = <T>(path: string, query?: Query) => request<T>(path, { method
 export const post = <T>(path: string, body?: unknown, o?: Omit<RequestOptions, 'method' | 'body'>) =>
   request<T>(path, { ...o, method: 'POST', body: body ?? {} });
 
-export const del = <T>(path: string) => request<T>(path, { method: 'DELETE' });
+export const del = <T>(path: string, o?: Omit<RequestOptions, 'method' | 'body'>) =>
+  request<T>(path, { ...o, method: 'DELETE' });
 
 /**
  * A fresh idempotency key (RFC 4122 v4 shape). Hermes has no `crypto.randomUUID`,

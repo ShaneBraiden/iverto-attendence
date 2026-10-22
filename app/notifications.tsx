@@ -9,10 +9,10 @@ import { Screen, TopBar } from '@/components/Screen';
 import { Card, EmptyState, ErrorState, IconTile, LoadMore } from '@/components/ui';
 import { SkeletonList } from '@/components/Skeleton';
 import { colors, spacing, type } from '@/theme';
-import { AppNotification, getNotifications, markNotificationsRead } from '@/lib/api';
+import { getNotifications, markNotificationsRead } from '@/lib/api';
 import { isManager, useMe } from '@/lib/auth';
 import { timeAgo } from '@/lib/datetime';
-import { isApprovalPrompt, kindOfNotification } from '@/lib/requests';
+import { notificationTarget } from '@/lib/requests';
 import { useScreenData } from '@/lib/useScreenData';
 
 type IconName = React.ComponentProps<typeof IconTile>['icon'];
@@ -30,18 +30,6 @@ function iconOf(type: string | null | undefined): IconName {
   if (t.startsWith('CORRECTION')) return 'create-outline';
   if (t.startsWith('LEAVE')) return 'airplane-outline';
   return 'notifications-outline';
-}
-
-/** Where tapping a notification goes, or null if it is informational only. */
-function targetOf(n: AppNotification, manager: boolean) {
-  const kind = kindOfNotification(n.type);
-  const id = n.data && typeof n.data.id === 'string' ? n.data.id : null;
-  if (kind && id) {
-    return `/request/${id}?kind=${kind}${manager && isApprovalPrompt(n.type) ? '&role=manager' : ''}`;
-  }
-  const date = n.data && typeof n.data.date === 'string' ? n.data.date : null;
-  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) return `/day/${date}`;
-  return null;
 }
 
 export default function Notifications() {
@@ -98,7 +86,7 @@ export default function Notifications() {
         ) : data?.items.length ? (
           <>
             {data.items.map((n) => {
-              const target = targetOf(n, manager);
+              const target = notificationTarget(n, manager);
               return (
                 <Card
                   key={n.id}
