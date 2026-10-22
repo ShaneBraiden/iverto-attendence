@@ -1,45 +1,42 @@
 /**
- * Profile, shared by both role shells: identity, work details, face
- * enrolment, shortcuts, password change, and the role switch for demos.
+ * Profile, shared by both shells: identity and work details from
+ * `/mobile/me`, shortcuts, password change, sign-out, and — for people who
+ * approve — the switch between their own attendance and the manager view.
  */
 import React, { useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Linking, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
+import Constants from 'expo-constants';
 import { Screen, TopBar } from '@/components/Screen';
-import { Avatar, Button, Card, Divider, Field, ListTile, Note, PoweredBy, Row } from '@/components/ui';
+import { Avatar, Button, Card, Divider, ListTile, Note, PoweredBy, Row } from '@/components/ui';
 import { LogoWatermark } from '@/components/Logo';
 import { Sheet } from '@/components/Sheet';
+import { PasswordForm } from '@/components/PasswordForm';
 import { colors, spacing, type } from '@/theme';
-import { shiftLabel } from '@/lib/attendance';
-import { employee, ME_ID, ORG, Role, shiftOf, teamOf, unreadCount } from '@/lib/data';
+import { BRAND } from '@/constants/brand';
+import { getNotifications } from '@/lib/api';
+import { isManager, useAuth, useMe } from '@/lib/auth';
+import { isoToDate } from '@/lib/datetime';
+import { humanize } from '@/lib/format';
+import { useScreenData } from '@/lib/useScreenData';
 
-export function ProfileView({ role }: { role: Role }) {
-  const me = employee(ME_ID[role]);
-  const manager = me.managerId ? employee(me.managerId) : null;
+const PUNCH_POLICY: Record<string, string> = {
+  ALWAYS: 'You can check in and out from the app on any working day. Your location is saved with each punch.',
+  REMOTE_DAYS: 'You can check in from the app on days your remote-work request is approved.',
+};
+
+export function ProfileView({ shell }: { shell: 'employee' | 'manager' }) {
+  const me = useMe();
+  const { signOut } = useAuth();
+  const emp = me.employee;
+  const manager = emp?.manager ?? null;
+  const approver = isManager(me);
   const [pwOpen, setPwOpen] = useState(false);
-  const [current, setCurrent] = useState('');
-  const [next, setNext] = useState('');
-  const [confirm, setConfirm] = useState('');
-  const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const { data: inbox } = useScreenData(() => getNotifications(null, 1));
 
-  const pwError =
-    next && next.length < 10
-      ? 'At least 10 characters.'
-      : confirm && confirm !== next
-        ? 'Passwords do not match.'
-        : null;
-
-  const savePassword = () => {
-    setSaving(true);
-    setTimeout(() => {
-      setSaving(false);
-      setSaved(true);
-      setCurrent('');
-      setNext('');
-      setConfirm('');
-    }, 700);
-  };
+  const policy = PUNCH_POLICY[me.features?.mobilePunch ?? ''];
 
   return (
     <View style={{ flex: 1 }}>
@@ -48,12 +45,13 @@ export function ProfileView({ role }: { role: Role }) {
       <Screen>
         <Card>
           <View style={styles.id}>
-            <Avatar size={64} icon={role === 'manager' ? 'people-outline' : 'person-outline'} />
+            <Avatar size={64} icon={shell === 'manager' ? 'people-outline' : 'person-outline'} />
             <View style={{ flex: 1 }}>
-              <Text style={styles.name}>{me.name}</Text>
-              <Text style={styles.sub}>{me.designation}</Text>
+              <Text style={styles.name}>{emp?.fullName ?? me.displayName}</Text>
+              {emp?.designation ? <Text style={styles.sub}>{emp.designation}</Text> : null}
               <Text style={styles.code}>
-                {me.code} · {role === 'manager' ? 'MANAGER' : 'EMPLOYEE'}
+                {emp?.employeeCode ? `${emp.employeeCode} · ` : ''}
+                {String(me.role).toUpperCase()}
               </Text>
             </View>
           </View>
@@ -61,61 +59,95 @@ export function ProfileView({ role }: { role: Role }) {
 
         <Card>
           <View style={{ gap: spacing.md }}>
-            <Row icon="business-outline" label="Organisation" value={ORG.name} />
-            <Row icon="git-branch-outline" label="Department" value={me.department} />
-            <Row icon="location-outline" label="Site" value={ORG.site} />
-            <Row icon="globe-outline" label="Timezone" value="Asia/Kolkata" />
-            <Row icon="time-outline" label="Shift" value={`${shiftOf(me).name} · ${shiftLabel(shiftOf(me))}`} />
-            {manager ? <Row icon="person-circle-outline" label="Reports to" value={manager.name} /> : null}
-            {role === 'manager' ? (
-              <Row icon="people-outline" label="Direct reports" value={String(teamOf(me.id).length)} />
-            ) : null}
+            {me.organisation ? <Row icon="business-outline" label="Organisation" value={me.organisation.name} /> : null}
+            {emp?.department ? <Row icon="git-branch-outline" label="Department" value={emp.department.name} /> : null}
+            {emp?.site ? <Row icon="location-outline" label="Site" value={emp.site.name} /> : null}
+            {emp?.site?.timezone ? <Row icon="globe-outline" label="Timezone" value={emp.site.timezone} /> : null}
+            {manager ? <Row icon="person-circle-outline" label="Reports to" value={manager.fullName} /> : null}
+            {emp?.joinedOn ? <Row icon="calendar-number-outline" label="Joined" value={isoToDate(emp.joinedOn)} /> : null}
             <Row icon="mail-outline" label="Email" value={me.email} />
           </View>
         </Card>
 
-        <Note
-          icon="scan-outline"
-          tone="success"
-          text={`Face enrolled on ${me.facesEnrolled} of 4 M50 terminals. Ask HR to re-enrol if a gate stops recognising you.`}
-        />
+        {policy ? <Note icon="phone-portrait-outline" tone="info" text={policy} /> : null}
 
         <Card padded={false}>
           <ListTile icon="calendar-outline" title="My roster" subtitle="Shifts for the next 14 days" onPress={() => router.push('/schedule')} />
           <Divider inset={60} />
-          <ListTile icon="sunny-outline" title="Holidays" subtitle="Karnataka calendar" onPress={() => router.push('/holidays')} />
+          <ListTile
+            icon="sunny-outline"
+            title="Holidays"
+            subtitle={emp?.site ? `${emp.site.name} calendar` : 'Holiday calendar'}
+            onPress={() => router.push('/holidays')}
+          />
           <Divider inset={60} />
           <ListTile
             icon="notifications-outline"
             title="Notifications"
-            subtitle={`${unreadCount(me.id)} unread`}
-            onPress={() => router.push(`/notifications?role=${role}`)}
+            subtitle={inbox ? (inbox.unreadCount ? `${inbox.unreadCount} unread` : 'All caught up') : undefined}
+            onPress={() => router.push('/notifications')}
           />
+          {manager?.phone ? (
+            <>
+              <Divider inset={60} />
+              <ListTile
+                icon="call-outline"
+                title={`Call ${manager.fullName.split(' ')[0]}`}
+                subtitle={manager.phone}
+                onPress={() => Linking.openURL(`tel:${manager.phone!.replace(/\s/g, '')}`)}
+              />
+            </>
+          ) : null}
           <Divider inset={60} />
-          <ListTile icon="key-outline" title="Change password" onPress={() => { setSaved(false); setPwOpen(true); }} />
-          <Divider inset={60} />
-          {role === 'manager' ? (
-            <ListTile
-              icon="swap-horizontal-outline"
-              title="Switch to employee view"
-              subtitle="See the app as Aarav (demo)"
-              onPress={() => router.replace('/employee')}
-            />
-          ) : (
-            <ListTile
-              icon="swap-horizontal-outline"
-              title="Switch to manager view"
-              subtitle="Approve your own requests as Kavya (demo)"
-              onPress={() => router.replace('/manager')}
-            />
-          )}
+          <ListTile
+            icon="key-outline"
+            title="Change password"
+            onPress={() => {
+              setSaved(false);
+              setPwOpen(true);
+            }}
+          />
+          {approver && shell === 'manager' ? (
+            <>
+              <Divider inset={60} />
+              <ListTile
+                icon="swap-horizontal-outline"
+                title="My attendance"
+                subtitle="Your own punches, leave and requests"
+                onPress={() => router.replace('/employee')}
+              />
+            </>
+          ) : null}
+          {approver && shell === 'employee' ? (
+            <>
+              <Divider inset={60} />
+              <ListTile
+                icon="swap-horizontal-outline"
+                title="Manager view"
+                subtitle="Live board, approvals and team attendance"
+                onPress={() => router.replace('/manager')}
+              />
+            </>
+          ) : null}
         </Card>
 
         <Card padded={false}>
-          <ListTile icon="log-out-outline" title="Sign out" danger onPress={() => router.replace('/')} />
+          <ListTile
+            icon="log-out-outline"
+            title={signingOut ? 'Signing out…' : 'Sign out'}
+            danger
+            onPress={async () => {
+              if (signingOut) return;
+              setSigningOut(true);
+              await signOut();
+            }}
+          />
         </Card>
 
-        <Text style={styles.version}>Iverto Attendance · v1.0.0 · demo data</Text>
+        <Text style={styles.version}>
+          {BRAND.name} · v{Constants.expoConfig?.version ?? '1.0.0'}
+          {me.organisation ? ` · ${me.organisation.name}` : ''}
+        </Text>
         <PoweredBy />
       </Screen>
 
@@ -126,28 +158,17 @@ export function ProfileView({ role }: { role: Role }) {
             <Button label="Done" onPress={() => setPwOpen(false)} />
           </View>
         ) : (
-          <View style={{ gap: spacing.md }}>
-            <Field label="Current password" icon="lock-closed-outline" value={current} onChangeText={setCurrent} secureTextEntry />
-            <Field label="New password" icon="key-outline" value={next} onChangeText={setNext} secureTextEntry />
-            <Field
-              label="Confirm new password"
-              icon="key-outline"
-              value={confirm}
-              onChangeText={setConfirm}
-              secureTextEntry
-              hint={pwError ?? undefined}
-            />
-            <Button
-              label="Update password"
-              loading={saving}
-              disabled={!current || !next || next !== confirm || next.length < 10}
-              onPress={savePassword}
-            />
-          </View>
+          <PasswordForm onDone={() => setSaved(true)} />
         )}
       </Sheet>
     </View>
   );
+}
+
+/** Role label for headers — "Employee", "Manager", "Hr" reads badly, so HR is spelled out. */
+export function roleLabel(role: string) {
+  const r = role.toUpperCase();
+  return r === 'HR' ? 'HR' : humanize(r);
 }
 
 const styles = StyleSheet.create({

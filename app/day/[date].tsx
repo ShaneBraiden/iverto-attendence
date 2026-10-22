@@ -1,7 +1,7 @@
 /**
- * Day detail — the "Detailed In/Out" drawer (§1): status, flags, worked
- * segments, and every punch with its device / source. Own days offer a
- * correction request.
+ * Day detail — the "Detailed In/Out" drawer (§1): status, worked segments,
+ * every punch with its device / source, and any corrections. Offers a
+ * correction request when the day needs one.
  */
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
@@ -11,23 +11,31 @@ import { Button, Card, EmptyState, ErrorState, Note, Row, SectionHeader, StatusP
 import { SkeletonDetail } from '@/components/Skeleton';
 import { DayMetrics, DayTimeline, PunchList, RequestCard } from '@/components/attendance';
 import { colors, spacing, type } from '@/theme';
-import { shiftLabel } from '@/lib/attendance';
-import { formatMinutes, isoToTime } from '@/lib/datetime';
+import { getDay, toReq } from '@/lib/api';
+import { formatMinutes } from '@/lib/datetime';
+import { shortDay, timeLabel, todayIso } from '@/lib/format';
+import { statusInfo } from '@/lib/status';
 import { useScreenData } from '@/lib/useScreenData';
-import { dayFor, employee, leaveType, ME_ID, shortDay } from '@/lib/data';
+
+/** Days on which there is nothing to correct. */
+const OFF_STATUSES = new Set(['WEEKLY_OFF', 'HOLIDAY', 'ON_LEAVE', 'LEAVE']);
 
 export default function DayDetail() {
-  const params = useLocalSearchParams<{ date: string; emp?: string }>();
-  const empId = params.emp ?? ME_ID.employee;
-  const own = empId === ME_ID.employee;
-  const { data: day, loading, error, refetch } = useScreenData(() => dayFor(empId, params.date), [params.date, empId]);
+  const { date } = useLocalSearchParams<{ date: string }>();
+  const { data: day, loading, error, refetch } = useScreenData(() => getDay(date), [date]);
 
-  const pendingCorrection = day?.requests.some((r) => r.kind === 'CORRECTION' && r.status === 'PENDING');
-  const canCorrect = own && day && !day.future && day.dayType === 'WORK' && !day.leave && !pendingCorrection;
+  const isToday = date === todayIso();
+  const segments = day?.segments ?? [];
+  const open = segments.some((s) => !s.out);
+  const closed = segments.filter((s) => s.out);
+  const corrections = (day?.corrections ?? []).map((c) => toReq('CORRECTION', { workDate: date, ...c }));
+  const pendingCorrection = corrections.some((c) => c.status === 'PENDING');
+  const missed = !isToday && open;
+  const canCorrect = !!day && date <= todayIso() && !OFF_STATUSES.has(day.status) && !pendingCorrection;
 
   return (
     <View style={{ flex: 1 }}>
-      <TopBar title={shortDay(params.date)} subtitle={own ? 'My attendance' : employee(empId).name} />
+      <TopBar title={shortDay(date)} subtitle="My attendance" />
       <Screen clearTabBar={false}>
         {loading && !day ? (
           <SkeletonDetail />
@@ -37,90 +45,69 @@ export default function DayDetail() {
           <>
             <Card>
               <View style={styles.head}>
-                <Text style={styles.caption}>{day.isToday ? 'TODAY' : day.future ? 'SCHEDULED' : 'FINAL STATUS'}</Text>
-                <View style={styles.pills}>
-                  {day.liveState && day.isToday ? <StatusPill status={day.liveState} small /> : null}
-                  {!day.future ? <StatusPill status={day.status} small /> : null}
-                </View>
+                <Text style={styles.caption}>{isToday ? 'TODAY' : 'FINAL STATUS'}</Text>
+                <StatusPill status={day.status} small />
               </View>
-              <Text style={styles.title}>
-                {day.shift ? `${day.shift.name} · ${shiftLabel(day.shift)}` : day.holidayName ?? 'Weekly off'}
-              </Text>
-              {day.shift && !day.future ? (
+              <Text style={styles.title}>{day.shiftName ?? statusInfo(day.status).label}</Text>
+              {segments.length ? (
                 <View style={{ gap: spacing.md, marginTop: spacing.lg }}>
-                  <DayTimeline day={day} />
-                  <DayMetrics day={day} />
+                  <DayTimeline date={date} spans={segments} label={day.shiftName} />
+                  <DayMetrics
+                    firstIn={segments[0].local?.in ?? segments[0].in}
+                    lastOut={closed.length ? closed[closed.length - 1].local?.out ?? closed[closed.length - 1].out : null}
+                    workedMinutes={day.workedMinutes}
+                    inside={open}
+                  />
                 </View>
               ) : null}
             </Card>
 
-            {day.missedPunch && !day.corrected ? (
-              <Note icon="alert-circle-outline" tone="danger" text="A punch is missing — there's an in without an out (or the reverse). Request a correction so the day is counted." />
-            ) : null}
-            {day.corrected ? (
-              <Note icon="create-outline" tone="brand" text="This day includes an approved correction. The original punches are kept alongside it." />
-            ) : null}
-            {day.leave ? (
+            {missed ? (
               <Note
-                icon="airplane-outline"
-                tone="info"
-                text={`${leaveType(day.leave.code).name}${day.leave.half ? ` · ${day.leave.half === 'FIRST' ? 'first' : 'second'} half` : ''} approved for this day.`}
+                icon="alert-circle-outline"
+                tone="danger"
+                text="A punch is missing — there's an in without an out. Request a correction so the day is counted."
               />
             ) : null}
+            {segments.some((s) => s.credited) ? (
+              <Note icon="create-outline" tone="brand" text="Some of this time was credited by an approved correction. The original punches are kept alongside it." />
+            ) : null}
 
-            {!day.future && day.dayType === 'WORK' ? (
+            {segments.length > 1 || day.workedMinutes ? (
               <Card>
                 <View style={{ gap: spacing.md }}>
-                  <Row icon="time-outline" label="Required" value={formatMinutes(day.requiredMin)} />
-                  <Row icon="hourglass-outline" label="Worked" value={day.workedMin ? formatMinutes(day.workedMin) : '—'} />
-                  <Row icon="cafe-outline" label="Breaks" value={day.breakMin ? formatMinutes(day.breakMin) : '—'} />
-                  <Row
-                    icon="alarm-outline"
-                    label="Late"
-                    value={day.lateMin ? `${day.lateMin} min` : 'On time'}
-                    color={day.lateMin ? colors.warning : colors.success}
-                  />
-                  <Row
-                    icon="exit-outline"
-                    label="Early exit"
-                    value={day.earlyMin ? `${day.earlyMin} min` : '—'}
-                    color={day.earlyMin ? colors.warning : undefined}
-                  />
-                  <Row icon="trending-up-outline" label="Overtime" value={day.otMin ? formatMinutes(day.otMin) : '—'} />
-                  {day.remote ? <Row icon="home-outline" label="Mode" value="Remote / field" /> : null}
-                  {day.segments.length > 1 ? (
+                  <Row icon="hourglass-outline" label="Worked" value={day.workedMinutes ? formatMinutes(day.workedMinutes) : '—'} />
+                  {segments.length > 1 ? (
                     <Row
                       icon="swap-horizontal-outline"
                       label="Sessions"
-                      value={day.segments.map((s) => `${isoToTime(s.in)}–${s.out ? isoToTime(s.out) : 'now'}`).join(', ')}
+                      value={segments
+                        .map((s) => `${timeLabel(s.local?.in ?? s.in)}–${s.out ? timeLabel(s.local?.out ?? s.out) : 'now'}`)
+                        .join(', ')}
                     />
                   ) : null}
                 </View>
               </Card>
             ) : null}
 
-            {!day.future ? (
-              <>
-                <SectionHeader title={`Punches · ${day.punches.length}`} />
-                {day.punches.length ? (
-                  <Card>
-                    <PunchList punches={day.punches} />
-                  </Card>
-                ) : (
-                  <EmptyState
-                    icon="scan-outline"
-                    title="No punches"
-                    message={day.dayType === 'WORK' && !day.leave ? 'No terminal saw you this day.' : 'Nothing expected on a day off.'}
-                  />
-                )}
-              </>
-            ) : null}
+            <SectionHeader title={`Punches · ${day.punches.length}`} />
+            {day.punches.length ? (
+              <Card>
+                <PunchList punches={day.punches} />
+              </Card>
+            ) : (
+              <EmptyState
+                icon="scan-outline"
+                title="No punches"
+                message={OFF_STATUSES.has(day.status) ? 'Nothing expected on a day off.' : 'No terminal saw you this day.'}
+              />
+            )}
 
-            {day.requests.length ? (
+            {corrections.length ? (
               <>
-                <SectionHeader title="Requests for this day" />
-                {day.requests.map((r) => (
-                  <RequestCard key={r.id} request={r} onPress={() => router.push(`/request/${r.id}`)} />
+                <SectionHeader title="Corrections for this day" />
+                {corrections.map((r) => (
+                  <RequestCard key={r.id} request={r} onPress={() => router.push(`/request/${r.id}?kind=CORRECTION`)} />
                 ))}
               </>
             ) : null}
@@ -129,8 +116,8 @@ export default function DayDetail() {
               <Button
                 label="Request a correction"
                 icon="create-outline"
-                variant={day.missedPunch || day.status === 'ABSENT' ? 'primary' : 'secondary'}
-                onPress={() => router.push(`/request/new?kind=CORRECTION&date=${day.date}`)}
+                variant={missed || day.status === 'ABSENT' ? 'primary' : 'secondary'}
+                onPress={() => router.push(`/request/new?kind=CORRECTION&date=${date}`)}
               />
             ) : null}
           </>
@@ -142,7 +129,8 @@ export default function DayDetail() {
 
 const styles = StyleSheet.create({
   head: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  pills: { flexDirection: 'row', gap: spacing.xs },
   caption: { ...type.caption, color: colors.textFaint },
   title: { ...type.h2, color: colors.text, marginTop: spacing.sm },
 });
+
+export { ScreenErrorBoundary as ErrorBoundary } from '@/components/RouteError';

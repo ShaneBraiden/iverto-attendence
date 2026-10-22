@@ -4,10 +4,11 @@
  * Mapping a domain state onto a colour is domain logic, not a design token, so
  * it lives here rather than in `theme/`. Register every status the product has
  * in `STATUS`; `StatusPill` reads nothing else. Unknown statuses fall back to
- * a neutral pill with the raw value as the label, so a new backend state shows
- * up readable rather than crashing.
+ * a neutral pill with the value humanised as the label (`MISSED_PUNCH` →
+ * "Missed punch"), so a new backend state shows up readable.
  */
 import { colors } from '@/theme';
+import { humanize } from '@/lib/format';
 
 export type StatusTone = 'pending' | 'active' | 'success' | 'warning' | 'danger' | 'neutral';
 
@@ -30,10 +31,16 @@ export const STATUS: Record<string, { tone: StatusTone; label: string; icon: str
   HALF_DAY: { tone: 'warning', label: 'Half day', icon: 'contrast-outline' },
   ABSENT: { tone: 'danger', label: 'Absent', icon: 'close-circle-outline' },
   ON_LEAVE: { tone: 'active', label: 'On leave', icon: 'airplane-outline' },
+  LEAVE: { tone: 'active', label: 'On leave', icon: 'airplane-outline' },
   HALF_LEAVE: { tone: 'active', label: 'Half leave', icon: 'airplane-outline' },
   REMOTE: { tone: 'active', label: 'Remote', icon: 'home-outline' },
   HOLIDAY: { tone: 'neutral', label: 'Holiday', icon: 'sunny-outline' },
   WEEKLY_OFF: { tone: 'neutral', label: 'Weekly off', icon: 'cafe-outline' },
+  WORKING: { tone: 'neutral', label: 'Working day', icon: 'briefcase-outline' },
+  OVERRIDE: { tone: 'active', label: 'Changed', icon: 'swap-horizontal-outline' },
+  MISSED_PUNCH: { tone: 'danger', label: 'Missed punch', icon: 'alert-circle-outline' },
+  OPEN: { tone: 'pending', label: 'In progress', icon: 'time-outline' },
+  IN_PROGRESS: { tone: 'pending', label: 'In progress', icon: 'time-outline' },
   // Live state
   OFF: { tone: 'neutral', label: 'Off today', icon: 'cafe-outline' },
   NOT_YET_IN: { tone: 'neutral', label: 'Not yet in', icon: 'hourglass-outline' },
@@ -55,20 +62,23 @@ export const DAY_CODE: Record<string, string> = {
   HALF_DAY: 'HD',
   ABSENT: 'A',
   ON_LEAVE: 'L',
+  LEAVE: 'L',
   HALF_LEAVE: '½L',
   REMOTE: 'R',
   HOLIDAY: 'H',
   WEEKLY_OFF: 'WO',
   PENDING: '•',
+  OPEN: '•',
+  IN_PROGRESS: '•',
 };
 
-export function statusInfo(status: string) {
-  const entry = STATUS[status];
+export function statusInfo(status: string | null | undefined) {
+  const entry = status ? STATUS[status] : undefined;
   const tone: StatusTone = entry?.tone ?? 'neutral';
   return {
     tone,
     ...TONE_STYLE[tone],
     icon: entry?.icon ?? 'ellipse-outline',
-    label: entry?.label ?? status,
+    label: entry?.label ?? humanize(status),
   };
 }

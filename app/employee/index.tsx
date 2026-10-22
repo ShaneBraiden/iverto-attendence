@@ -2,9 +2,10 @@
  * Employee · Today — shift, live state, in/out so far, mobile punch, quick
  * requests, and what's coming up.
  */
-import React, { useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import React, { useRef, useState } from 'react';
+import { Linking, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
+import * as Location from 'expo-location';
 import { AppHeader, Screen } from '@/components/Screen';
 import {
   Button,
@@ -23,67 +24,155 @@ import { SkeletonCard, SkeletonDetailRows, SkeletonList, SkeletonStats } from '@
 import { DayMetrics, DayTimeline, RequestCard } from '@/components/attendance';
 import { timeGreeting } from '@/constants/greeting';
 import { colors, spacing, type } from '@/theme';
-import { shiftLabel } from '@/lib/attendance';
+import {
+  ApiError,
+  createPunch,
+  getAllMyRequests,
+  getLeaveBalances,
+  getMonth,
+  getNotifications,
+  getToday,
+  messageOf,
+  newIdempotencyKey,
+  RequestKind,
+} from '@/lib/api';
+import { useMe } from '@/lib/auth';
+import { pairPunches } from '@/lib/attendance';
 import { formatMinutes, isoToTime } from '@/lib/datetime';
+import { monthKey, shiftTimes, shortDay, timeLabel, todayIso } from '@/lib/format';
+import { myRequestKinds } from '@/lib/requests';
 import { statusInfo } from '@/lib/status';
 import { useScreenData } from '@/lib/useScreenData';
-import {
-  canMobilePunch,
-  dayFor,
-  employee,
-  leaveBalances,
-  ME_ID,
-  mobilePunch,
-  monthSummary,
-  monthDays,
-  requestsFor,
-  schedule,
-  shortDay,
-  todayIso,
-  unreadCount,
-} from '@/lib/data';
 
-const ME = ME_ID.employee;
+/** Statuses that mean there is no shift to punch for, whatever the roster says. */
+const OFF_TODAY = new Set(['ON_LEAVE', 'LEAVE', 'HOLIDAY', 'WEEKLY_OFF']);
 
-function load() {
-  const today = dayFor(ME, todayIso());
-  const n = new Date();
-  const month = monthSummary(monthDays(ME, n.getFullYear(), n.getMonth()));
-  const next = schedule(ME, 8).slice(1).find((d) => d.dayType !== 'WORK' || d.leave);
-  const cl = leaveBalances(ME).find((b) => b.type.code === 'CL')!;
-  const pending = requestsFor(ME).filter((r) => r.status === 'PENDING');
-  return { today, month, next, cl, pending, unread: unreadCount(ME) };
+/** Secondary panels degrade to "not shown" rather than failing the whole screen. */
+const optional = <T,>(p: Promise<T>) => p.catch(() => null);
+
+async function load(leaveEnabled: boolean, kinds: RequestKind[]) {
+  const now = new Date();
+  const [today, month, balances, requests, inbox] = await Promise.all([
+    getToday(),
+    optional(getMonth(monthKey(now.getFullYear(), now.getMonth()))),
+    leaveEnabled ? optional(getLeaveBalances(now.getFullYear())) : Promise.resolve(null),
+    optional(getAllMyRequests(20, kinds)),
+    optional(getNotifications(null, 1)),
+  ]);
+  const t = todayIso();
+  const balance =
+    balances?.balances.find((b) => b.leaveType.code === 'CL') ?? balances?.balances[0] ?? null;
+  return {
+    today,
+    totals: month?.totals ?? null,
+    missed: month ? month.days.filter((d) => d.missedPunch && d.date < t).length : 0,
+    balance,
+    pending: (requests ?? []).filter((r) => r.status === 'PENDING'),
+    unread: inbox?.unreadCount,
+  };
+}
+
+/** Location was refused with "don't ask again" — only the settings screen can undo it. */
+class LocationBlocked extends Error {}
+
+/** A GPS fix, or a sentence saying why there isn't one. */
+async function currentFix() {
+  const perm = await Location.requestForegroundPermissionsAsync();
+  if (perm.status !== 'granted') {
+    if (!perm.canAskAgain) {
+      throw new LocationBlocked('Location is turned off for this app. Allow it in Settings to punch from the app.');
+    }
+    throw new Error('Location access is needed to punch from the app. Allow it when your phone asks.');
+  }
+  if (!(await Location.hasServicesEnabledAsync())) {
+    throw new Error('Turn on location (GPS) to punch from the app.');
+  }
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("Couldn't get a GPS fix. Move into the open and try again.")), 20_000),
+  );
+  return Promise.race([Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }), timeout]);
 }
 
 export default function EmployeeToday() {
-  const me = employee(ME);
-  const { data, loading, error, refetch } = useScreenData(load);
+  const me = useMe();
+  const emp = me.employee;
+  const { data, loading, error, refetch } = useScreenData(() => load(me.features?.leave !== false, myRequestKinds(me)));
   const [punching, setPunching] = useState(false);
   const [justPunched, setJustPunched] = useState<string | null>(null);
-
-  const doPunch = () => {
-    setPunching(true);
-    setTimeout(() => {
-      const p = mobilePunch(ME);
-      setJustPunched(`${p.direction === 'IN' ? 'Checked in' : 'Checked out'} at ${isoToTime(p.at)} · location recorded`);
-      setPunching(false);
-      refetch();
-    }, 700);
-  };
+  const [punchError, setPunchError] = useState<string | null>(null);
+  const [locationBlocked, setLocationBlocked] = useState(false);
+  /* Reused if the person retries the same punch after a dropped connection,
+     so the server records it once (§1, Idempotency-Key). */
+  const punchKey = useRef<{ direction: 'in' | 'out'; key: string } | null>(null);
 
   const today = data?.today;
-  const live = today?.liveState ? statusInfo(today.liveState) : null;
-  const inside = today?.segments.some((s) => !s.out);
+  const day = today?.day ?? null;
+  const { spans, inside } = pairPunches(today?.punches ?? []);
+  const live = day ? statusInfo(day.status) : null;
+  const working =
+    !!day && !OFF_TODAY.has(day.status) && (day.dayType === 'WORKING' || !!day.shift || !!day.local?.schedStart);
+
+  const doPunch = async () => {
+    const direction = inside ? 'out' : 'in';
+    setPunching(true);
+    setPunchError(null);
+    setLocationBlocked(false);
+    setJustPunched(null);
+    try {
+      const fix = await currentFix();
+      if (punchKey.current?.direction !== direction) punchKey.current = { direction, key: newIdempotencyKey() };
+      const res = await createPunch(
+        {
+          direction,
+          lat: fix.coords.latitude,
+          lng: fix.coords.longitude,
+          accuracy: fix.coords.accuracy ?? null,
+          isMockLocation: !!fix.mocked,
+          clientTime: new Date().toISOString(),
+        },
+        punchKey.current.key,
+      );
+      punchKey.current = null;
+      const out = (res.direction ?? direction).toLowerCase() === 'out';
+      setJustPunched(`${out ? 'Checked out' : 'Checked in'} at ${isoToTime(res.punchedAt)} · location recorded`);
+      refetch();
+    } catch (e) {
+      /* A refusal is final for this attempt; a fresh key goes with the next one.
+         An attempt still in flight, a rate limit or a server error may yet have
+         been recorded, so the retry keeps the key and the server dedupes it. */
+      if (
+        e instanceof ApiError &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 429 &&
+        e.code !== 'IDEMPOTENCY_IN_PROGRESS'
+      ) {
+        punchKey.current = null;
+      }
+      setLocationBlocked(e instanceof LocationBlocked);
+      setPunchError(messageOf(e, 'The punch was not recorded. Please try again.'));
+    } finally {
+      setPunching(false);
+    }
+  };
+
+  const quick = (
+    [
+      me.features?.leave !== false && (['LEAVE', 'Apply leave', 'airplane-outline'] as const),
+      ['CORRECTION', 'Fix a punch', 'create-outline'] as const,
+      me.features?.remoteWork && (['REMOTE', 'Work remote', 'home-outline'] as const),
+    ] as const
+  ).filter(Boolean) as (readonly ['LEAVE' | 'CORRECTION' | 'REMOTE', string, 'airplane-outline' | 'create-outline' | 'home-outline'])[];
 
   return (
     <View style={{ flex: 1 }}>
       <AppHeader
         greeting={timeGreeting()}
         title="Employee"
-        meta={`${me.name} · ${me.code}`}
+        meta={emp ? `${emp.fullName} · ${emp.employeeCode}` : me.displayName}
         icon="person-outline"
         badgeCount={data?.unread}
-        onBell={() => router.push('/notifications?role=employee')}
+        onBell={() => router.push('/notifications')}
       />
       <Screen>
         {loading && !data ? (
@@ -98,47 +187,64 @@ export default function EmployeeToday() {
           <ErrorState error={error} onRetry={refetch} />
         ) : (
           <>
-            <Card onPress={() => router.push(`/day/${today.date}`)}>
+            <Card onPress={day ? () => router.push(`/day/${day.workDate}`) : undefined}>
               <View style={styles.headRow}>
-                <Text style={styles.caption}>TODAY · {shortDay(today.date).toUpperCase()}</Text>
-                {live ? (
+                <Text style={styles.caption}>TODAY · {shortDay(day?.workDate ?? todayIso()).toUpperCase()}</Text>
+                {day && live ? (
                   <View style={styles.liveRow}>
-                    <LiveDot color={live.fg} />
-                    <StatusPill status={today.liveState!} small />
+                    {inside ? <LiveDot color={colors.success} /> : null}
+                    <StatusPill status={day.status} small />
                   </View>
-                ) : (
-                  <StatusPill status={today.status} small />
-                )}
+                ) : null}
               </View>
-              {today.shift ? (
+              {day && working ? (
                 <>
                   <Text style={styles.title}>
-                    {today.shift.name} shift · {shiftLabel(today.shift)}
+                    {day.shift?.name ?? day.shiftName ?? 'Shift'}
+                    {shiftTimes(day.local?.schedStart, day.local?.schedEnd) ? ` · ${shiftTimes(day.local.schedStart, day.local.schedEnd)}` : ''}
                   </Text>
                   <Text style={styles.sub}>
-                    {today.firstIn
+                    {spans.length
                       ? inside
-                        ? `Inside since ${isoToTime(today.segments[today.segments.length - 1].in)} · ${formatMinutes(today.workedMin)} worked so far`
-                        : `Last out ${isoToTime(today.lastOut)} · ${formatMinutes(today.workedMin)} worked`
-                      : 'Look at the M50 terminal at the gate to punch in.'}
+                        ? `Inside since ${isoToTime(spans[spans.length - 1].in)} · ${formatMinutes(day.workedMinutes)} worked so far`
+                        : `Last out ${timeLabel(day.local?.lastOut ?? day.lastOut)} · ${formatMinutes(day.workedMinutes)} worked`
+                      : today.mobilePunch?.allowedNow
+                        ? 'Check in below, or at the terminal at the gate.'
+                        : 'Look at the terminal at the gate to punch in.'}
                   </Text>
                   <View style={{ gap: spacing.md, marginTop: spacing.lg }}>
-                    <DayTimeline day={today} />
-                    <DayMetrics day={today} />
+                    <DayTimeline
+                      date={day.workDate}
+                      schedStart={day.local?.schedStart}
+                      schedEnd={day.local?.schedEnd}
+                      spans={spans}
+                      label={day.shift?.name ?? day.shiftName}
+                    />
+                    <DayMetrics
+                      firstIn={day.local?.firstIn ?? day.firstIn}
+                      lastOut={day.local?.lastOut ?? day.lastOut}
+                      workedMinutes={day.workedMinutes}
+                      late={day.isLate}
+                      inside={inside}
+                    />
                   </View>
                 </>
               ) : (
                 <Text style={styles.title}>
-                  {today.holidayName ?? (today.leave ? 'On leave today' : 'Weekly off')} — enjoy the day
+                  {day ? `${statusInfo(day.status).label} — enjoy the day` : 'No shift scheduled today'}
                 </Text>
               )}
             </Card>
 
-            {today.lateMin > 0 ? (
-              <Note icon="alarm-outline" tone="warning" text={`You were ${today.lateMin} min late today (grace is 10 min).`} />
+            {day?.isLate ? (
+              <Note
+                icon="alarm-outline"
+                tone="warning"
+                text={`You were marked late today${day.local?.firstIn && day.local?.schedStart ? ` — in at ${timeLabel(day.local.firstIn)}, shift starts ${timeLabel(day.local.schedStart)}` : ''}.`}
+              />
             ) : null}
 
-            {canMobilePunch(ME, today) ? (
+            {today.mobilePunch?.allowedNow ? (
               <Card>
                 <View style={styles.punchRow}>
                   <IconTile icon="location-outline" size={44} />
@@ -154,46 +260,71 @@ export default function EmployeeToday() {
                   icon={inside ? 'log-out-outline' : 'log-in-outline'}
                   variant={inside ? 'secondary' : 'primary'}
                   loading={punching}
+                  /* Until the refetch after a punch lands, the label still shows
+                     the old direction — a second tap would send it again. */
+                  disabled={loading}
                   onPress={doPunch}
                   style={{ marginTop: spacing.lg }}
                 />
                 {justPunched ? <Text style={styles.done}>✓ {justPunched}</Text> : null}
+                {punchError ? (
+                  <View style={{ marginTop: spacing.md }}>
+                    <Note icon="alert-circle-outline" tone="danger" text={punchError} />
+                    {locationBlocked ? (
+                      <Button
+                        label="Open settings"
+                        icon="settings-outline"
+                        variant="ghost"
+                        onPress={() => Linking.openSettings().catch(() => {})}
+                        style={{ marginTop: spacing.sm }}
+                      />
+                    ) : null}
+                  </View>
+                ) : null}
               </Card>
             ) : null}
 
-            <View style={styles.stats}>
-              <Stagger style={{ flex: 1 }}>
-                <StatCard
-                  label="Present"
-                  value={String(data.month.present)}
-                  icon="checkmark-circle-outline"
-                  fg={colors.success}
-                  bg={colors.successBg}
-                  onPress={() => router.push('/employee/attendance')}
-                />
-              </Stagger>
-              <Stagger style={{ flex: 1 }}>
-                <StatCard label="Late" value={String(data.month.late)} icon="alarm-outline" fg={colors.warning} bg={colors.warningBg} />
-              </Stagger>
-              <Stagger style={{ flex: 1 }}>
-                <StatCard
-                  label="CL left"
-                  value={String(data.cl.available)}
-                  icon="airplane-outline"
-                  fg={colors.info}
-                  bg={colors.infoBg}
-                  onPress={() => router.push('/employee/requests')}
-                />
-              </Stagger>
-            </View>
+            {data.totals || data.balance ? (
+              <View style={styles.stats}>
+                {data.totals ? (
+                  <Stagger style={{ flex: 1 }}>
+                    <StatCard
+                      label="Present"
+                      value={String(data.totals.present)}
+                      icon="checkmark-circle-outline"
+                      fg={colors.success}
+                      bg={colors.successBg}
+                      onPress={() => router.push('/employee/attendance')}
+                    />
+                  </Stagger>
+                ) : null}
+                {data.totals ? (
+                  <Stagger style={{ flex: 1 }}>
+                    <StatCard label="Late" value={String(data.totals.late)} icon="alarm-outline" fg={colors.warning} bg={colors.warningBg} />
+                  </Stagger>
+                ) : null}
+                {data.balance ? (
+                  <Stagger style={{ flex: 1 }}>
+                    <StatCard
+                      label={`${data.balance.leaveType.code} left`}
+                      value={String(data.balance.available)}
+                      icon="airplane-outline"
+                      fg={colors.info}
+                      bg={colors.infoBg}
+                      onPress={() => router.push('/employee/requests')}
+                    />
+                  </Stagger>
+                ) : null}
+              </View>
+            ) : null}
 
-            {data.month.missed > 0 ? (
+            {data.missed > 0 ? (
               <Card onPress={() => router.push('/employee/attendance')}>
                 <View style={styles.punchRow}>
                   <IconTile icon="alert-circle-outline" tint={colors.danger} bg={colors.dangerBg} />
                   <View style={{ flex: 1 }}>
                     <Text style={styles.cardTitle}>
-                      {data.month.missed} missed punch{data.month.missed > 1 ? 'es' : ''} this month
+                      {data.missed} missed punch{data.missed > 1 ? 'es' : ''} this month
                     </Text>
                     <Text style={styles.sub}>Open the day and request a correction.</Text>
                   </View>
@@ -203,13 +334,7 @@ export default function EmployeeToday() {
 
             <SectionHeader title="Quick requests" />
             <View style={styles.quick}>
-              {(
-                [
-                  ['LEAVE', 'Apply leave', 'airplane-outline'],
-                  ['CORRECTION', 'Fix a punch', 'create-outline'],
-                  ['REMOTE', 'Work remote', 'home-outline'],
-                ] as const
-              ).map(([kind, label, icon]) => (
+              {quick.map(([kind, label, icon]) => (
                 <Stagger key={kind} style={{ flex: 1 }}>
                   <Card onPress={() => router.push(`/request/new?kind=${kind}`)}>
                     <View style={{ alignItems: 'center', gap: spacing.sm }}>
@@ -221,15 +346,18 @@ export default function EmployeeToday() {
               ))}
             </View>
 
-            {data.next ? (
+            {today.nextShift ? (
               <Card onPress={() => router.push('/schedule')}>
                 <View style={styles.punchRow}>
                   <IconTile icon="calendar-outline" />
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.caption}>COMING UP</Text>
+                    <Text style={styles.caption}>NEXT SHIFT</Text>
                     <Text style={styles.cardTitle}>
-                      {shortDay(data.next.date)} · {data.next.holidayName ?? (data.next.leave ? 'Leave' : 'Weekly off')}
+                      {shortDay(today.nextShift.date)} · {today.nextShift.shift?.name ?? 'Shift'}
                     </Text>
+                    {shiftTimes(today.nextShift.local?.start, today.nextShift.local?.end) ? (
+                      <Text style={styles.sub}>{shiftTimes(today.nextShift.local.start, today.nextShift.local.end)}</Text>
+                    ) : null}
                   </View>
                   <Text style={styles.link}>Roster</Text>
                 </View>
@@ -243,7 +371,7 @@ export default function EmployeeToday() {
             />
             {data.pending.length ? (
               data.pending.slice(0, 2).map((r) => (
-                <RequestCard key={r.id} request={r} onPress={() => router.push(`/request/${r.id}`)} />
+                <RequestCard key={`${r.kind}:${r.id}`} request={r} onPress={() => router.push(`/request/${r.id}?kind=${r.kind}`)} />
               ))
             ) : (
               <EmptyState icon="checkmark-done-outline" title="Nothing pending" message="Your leave, remote and correction requests will show here." />
@@ -270,3 +398,5 @@ const styles = StyleSheet.create({
   quickLabel: { ...type.smallMed, color: colors.text, textAlign: 'center' },
   link: { ...type.smallMed, color: colors.primary },
 });
+
+export { ScreenErrorBoundary as ErrorBoundary } from '@/components/RouteError';

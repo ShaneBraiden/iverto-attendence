@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import React, { useEffect } from 'react';
 import { View, StyleSheet } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -14,6 +14,7 @@ import { Poppins_500Medium } from '@expo-google-fonts/poppins/500Medium';
 import { Poppins_600SemiBold } from '@expo-google-fonts/poppins/600SemiBold';
 import { Poppins_700Bold } from '@expo-google-fonts/poppins/700Bold';
 import { colors } from '@/theme';
+import { AuthProvider, isManager, useAuth } from '@/lib/auth';
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -31,6 +32,54 @@ function Canvas() {
   );
 }
 
+/**
+ * Routes, gated by the session. Signed out, only sign-in exists; with a
+ * temporary password, only the forced change; otherwise the shells and every
+ * detail screen. When a guard flips, expo-router drops the screens it no
+ * longer allows and lands on the first one it does — which is why the manager
+ * shell is listed ahead of the employee one for people who have both.
+ */
+function Routes() {
+  const { me, ready } = useAuth();
+  /* The splash stays up until the stored session has been read, so a signed-in
+     person never sees the sign-in form flash past on a cold start. */
+  useEffect(() => {
+    if (ready) SplashScreen.hideAsync().catch(() => {});
+  }, [ready]);
+  if (!ready) return null;
+  const signedIn = !!me && !me.mustChangePassword;
+
+  return (
+    <Stack
+      screenOptions={{
+        headerShown: false,
+        contentStyle: { backgroundColor: 'transparent' },
+        animation: 'slide_from_right',
+      }}
+    >
+      <Stack.Protected guard={!me}>
+        <Stack.Screen name="index" />
+      </Stack.Protected>
+      <Stack.Protected guard={!!me?.mustChangePassword}>
+        <Stack.Screen name="password" />
+      </Stack.Protected>
+      <Stack.Protected guard={signedIn}>
+        <Stack.Protected guard={isManager(me)}>
+          <Stack.Screen name="manager" />
+          <Stack.Screen name="team/[id]" />
+        </Stack.Protected>
+        <Stack.Screen name="employee" />
+        <Stack.Screen name="day/[date]" />
+        <Stack.Screen name="request/new" />
+        <Stack.Screen name="request/[id]" />
+        <Stack.Screen name="notifications" />
+        <Stack.Screen name="schedule" />
+        <Stack.Screen name="holidays" />
+      </Stack.Protected>
+    </Stack>
+  );
+}
+
 export default function RootLayout() {
   const [fontsLoaded, fontError] = useFonts({
     Poppins_400Regular,
@@ -39,26 +88,18 @@ export default function RootLayout() {
     Poppins_700Bold,
   });
 
-  const onReady = useCallback(() => {
-    if (fontsLoaded || fontError) SplashScreen.hideAsync().catch(() => {});
-  }, [fontsLoaded, fontError]);
-
   if (!fontsLoaded && !fontError) return null;
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }} onLayout={onReady}>
+    <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
         <StatusBar style="dark" />
         {/* App-wide neutral canvas — every glass surface sits on top of this. */}
         <LinearGradient colors={colors.bgGradient} style={{ flex: 1 }}>
           <Canvas />
-          <Stack
-            screenOptions={{
-              headerShown: false,
-              contentStyle: { backgroundColor: 'transparent' },
-              animation: 'slide_from_right',
-            }}
-          />
+          <AuthProvider>
+            <Routes />
+          </AuthProvider>
         </LinearGradient>
       </SafeAreaProvider>
     </GestureHandlerRootView>
@@ -70,3 +111,5 @@ const styles = StyleSheet.create({
   bloomTop: { top: -190, right: -150 },
   bloomBottom: { bottom: -220, left: -170 },
 });
+
+export { RootErrorBoundary as ErrorBoundary } from '@/components/RouteError';

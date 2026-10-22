@@ -1,7 +1,6 @@
 /**
- * Turns a thrown error into the words `ErrorState` shows. Kept separate from
- * any API client so screens backed by mock data and screens backed by a real
- * backend word failures the same way.
+ * Turns a thrown error into the words `ErrorState` shows. Reads the `status`
+ * that `ApiError` carries, so every screen words the same failure the same way.
  */
 import { BRAND } from '@/constants/brand';
 
@@ -43,9 +42,17 @@ export function errorCopy(error: unknown, fallback?: string): ErrorCopy {
       canRetry: false,
     };
   }
+  if (status === 429) {
+    return {
+      title: 'Slow down a little',
+      message: 'Too many requests in a short time. Wait a moment, then try again.',
+      icon: 'hourglass-outline',
+      canRetry: true,
+    };
+  }
   return {
     title: 'Something went wrong',
-    message: fallback ?? 'Please try again in a moment.',
+    message: fallback ?? (status && status < 500 && raw ? raw : 'Please try again in a moment.'),
     icon: 'alert-circle-outline',
     canRetry: true,
   };

@@ -11,17 +11,18 @@ import { Card, EmptyState, ErrorState, SectionHeader, StatusPill } from '@/compo
 import { SkeletonCard, SkeletonDetailRows, SkeletonList } from '@/components/Skeleton';
 import { CalendarLegend, Metric, MonthCalendar } from '@/components/attendance';
 import { colors, radius, spacing, type } from '@/theme';
-import { formatMinutes, isoToTime } from '@/lib/datetime';
+import { getMonth, MonthDay } from '@/lib/api';
+import { formatMinutes } from '@/lib/datetime';
+import { monthKey, monthLabel, shortDay, timeLabel, todayIso } from '@/lib/format';
 import { useScreenData } from '@/lib/useScreenData';
-import { DayView, ME_ID, monthDays, monthLabel, monthSummary, shortDay } from '@/lib/data';
 
-const ME = ME_ID.employee;
+/** How far back the month switcher goes. */
+const MAX_BACK = 12;
 
-function issueOf(d: DayView) {
-  if (d.missedPunch && !d.corrected) return 'Missed punch';
+function issueOf(d: MonthDay) {
+  if (d.missedPunch) return 'Missed punch';
   if (d.status === 'ABSENT') return 'No punches recorded';
-  if (d.lateMin) return `${d.lateMin} min late · in ${isoToTime(d.firstIn)}`;
-  if (d.earlyMin) return `Left ${d.earlyMin} min early`;
+  if (d.isLate) return `Late · in ${timeLabel(d.firstIn)}`;
   return null;
 }
 
@@ -29,19 +30,24 @@ export default function Attendance() {
   const [offset, setOffset] = useState(0);
   const base = new Date();
   const ref = new Date(base.getFullYear(), base.getMonth() + offset, 1);
-  const { data, loading, error, refetch } = useScreenData(() => {
-    const days = monthDays(ME, ref.getFullYear(), ref.getMonth());
-    return { days, summary: monthSummary(days) };
-  }, [offset]);
+  const key = monthKey(ref.getFullYear(), ref.getMonth());
+  const { data, loading, error, refetch } = useScreenData(() => getMonth(key), [key]);
 
-  const issues = (data?.days ?? []).filter((d) => !d.future && !d.isToday && issueOf(d)).reverse();
+  const today = todayIso();
+  const issues = (data?.days ?? []).filter((d) => d.date < today && issueOf(d)).reverse();
+  const totals = data?.totals;
 
   return (
     <View style={{ flex: 1 }}>
       <TopBar title="Attendance" subtitle="Tap a day for in/out detail" back={false} />
       <Screen>
         <View style={styles.monthNav}>
-          <Pressable onPress={() => setOffset(offset - 1)} hitSlop={10} style={styles.navBtn} disabled={offset <= -5}>
+          <Pressable
+            onPress={() => setOffset(offset - 1)}
+            hitSlop={10}
+            style={[styles.navBtn, offset <= -MAX_BACK && { opacity: 0.3 }]}
+            disabled={offset <= -MAX_BACK}
+          >
             <Ionicons name="chevron-back" size={18} color={colors.text} />
           </Pressable>
           <Text style={styles.month}>{monthLabel(ref.getFullYear(), ref.getMonth())}</Text>
@@ -55,34 +61,41 @@ export default function Attendance() {
           </Pressable>
         </View>
 
-        {loading ? (
+        {loading && data?.month !== key ? (
           <>
             <SkeletonCard>
               <SkeletonDetailRows count={6} />
             </SkeletonCard>
             <SkeletonList count={3} />
           </>
-        ) : error || !data ? (
+        ) : error || !data || !totals ? (
           <ErrorState error={error} onRetry={refetch} />
         ) : (
           <>
             <Card>
-              <MonthCalendar days={data.days} onPress={(d) => router.push(`/day/${d.date}`)} />
+              <MonthCalendar days={data.days} today={today} onPress={(d) => router.push(`/day/${d.date}`)} />
               <CalendarLegend />
             </Card>
 
             <Card>
-              <Text style={styles.caption}>MONTH SO FAR</Text>
+              <Text style={styles.caption}>{offset === 0 ? 'MONTH SO FAR' : 'MONTH TOTALS'}</Text>
               <View style={[styles.metrics, { marginTop: spacing.md }]}>
-                <Metric label="Present" value={String(data.summary.present)} tone={colors.success} />
-                <Metric label="Absent" value={String(data.summary.absent)} tone={data.summary.absent ? colors.danger : undefined} />
-                <Metric label="Leave" value={String(data.summary.leave)} tone={colors.info} />
+                <Metric label="Present" value={String(totals.present)} tone={colors.success} />
+                <Metric label="Absent" value={String(totals.absent)} tone={totals.absent ? colors.danger : undefined} />
+                <Metric label="Leave" value={String(totals.leave)} tone={colors.info} />
               </View>
               <View style={[styles.metrics, { marginTop: spacing.sm }]}>
-                <Metric label="Worked" value={formatMinutes(data.summary.workedMin)} />
-                <Metric label="Late" value={String(data.summary.late)} tone={data.summary.late ? colors.warning : undefined} />
-                <Metric label="Overtime" value={data.summary.otMin ? formatMinutes(data.summary.otMin) : '—'} />
+                <Metric label="Worked" value={totals.workedMinutes ? formatMinutes(totals.workedMinutes) : '—'} />
+                <Metric label="Late" value={String(totals.late)} tone={totals.late ? colors.warning : undefined} />
+                <Metric label="Overtime" value={totals.overtimeMinutes ? formatMinutes(totals.overtimeMinutes) : '—'} />
               </View>
+              {totals.remote || totals.halfDay || totals.holidays ? (
+                <View style={[styles.metrics, { marginTop: spacing.sm }]}>
+                  <Metric label="Remote" value={String(totals.remote)} />
+                  <Metric label="Half day" value={String(totals.halfDay)} />
+                  <Metric label="Holidays" value={String(totals.holidays)} />
+                </View>
+              ) : null}
             </Card>
 
             <SectionHeader title="Needs a look" />
@@ -97,11 +110,7 @@ export default function Attendance() {
                     <View style={{ flex: 1 }}>
                       <Text style={styles.issueTitle}>{issueOf(d)}</Text>
                       <Text style={styles.issueSub}>
-                        {d.requests.some((r) => r.kind === 'CORRECTION' && r.status === 'PENDING')
-                          ? 'Correction pending with your manager'
-                          : d.workedMin
-                            ? `${formatMinutes(d.workedMin)} worked`
-                            : 'Tap to request a correction'}
+                        {d.workedMinutes ? `${formatMinutes(d.workedMinutes)} worked` : 'Tap to request a correction'}
                       </Text>
                     </View>
                     <StatusPill status={d.status} small />
@@ -147,3 +156,5 @@ const styles = StyleSheet.create({
   issueTitle: { ...type.bodyMed, color: colors.text },
   issueSub: { ...type.small, color: colors.textMuted },
 });
+
+export { ScreenErrorBoundary as ErrorBoundary } from '@/components/RouteError';

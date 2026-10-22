@@ -9,18 +9,11 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { Card, IconTile, StatusPill } from '@/components/ui';
 import { colors, radius, spacing, type } from '@/theme';
 import { DAY_CODE, statusInfo } from '@/lib/status';
-import { shiftWindow, Punch } from '@/lib/attendance';
-import { isoToTime, formatMinutes } from '@/lib/datetime';
-import {
-  DayView,
-  Employee,
-  KIND_ICON,
-  KIND_LABEL,
-  Request,
-  requestSummary,
-  daysLabel,
-  now,
-} from '@/lib/data';
+import { directionOf, shiftWindow, Span } from '@/lib/attendance';
+import { formatMinutes, isoToTime } from '@/lib/datetime';
+import { daysLabel, initials, timeLabel } from '@/lib/format';
+import { KIND_ICON, KIND_LABEL, requestDays, requestSummary } from '@/lib/requests';
+import type { MonthDay, Punch, Req } from '@/lib/api';
 
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
@@ -28,9 +21,18 @@ type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
 const WEEK_HEAD = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 
-export function MonthCalendar({ days, onPress }: { days: DayView[]; onPress: (d: DayView) => void }) {
+export function MonthCalendar({
+  days,
+  today,
+  onPress,
+}: {
+  days: MonthDay[];
+  /** `YYYY-MM-DD`; days after it render muted. */
+  today: string;
+  onPress: (d: MonthDay) => void;
+}) {
   const lead = days.length ? new Date(days[0].date + 'T00:00:00').getDay() : 0;
-  const cells: (DayView | null)[] = [...Array(lead).fill(null), ...days];
+  const cells: (MonthDay | null)[] = [...Array(lead).fill(null), ...days];
   while (cells.length % 7) cells.push(null);
   const weeks = Array.from({ length: cells.length / 7 }, (_, i) => cells.slice(i * 7, i * 7 + 7));
 
@@ -45,34 +47,49 @@ export function MonthCalendar({ days, onPress }: { days: DayView[]; onPress: (d:
       </View>
       {weeks.map((w, i) => (
         <View key={i} style={styles.week}>
-          {w.map((d, j) => (d ? <CalendarCell key={d.date} day={d} onPress={() => onPress(d)} /> : <View key={j} style={styles.cell} />))}
+          {w.map((d, j) =>
+            d ? (
+              <CalendarCell key={d.date} day={d} future={d.date > today} isToday={d.date === today} onPress={() => onPress(d)} />
+            ) : (
+              <View key={j} style={styles.cell} />
+            ),
+          )}
         </View>
       ))}
     </View>
   );
 }
 
-function CalendarCell({ day, onPress }: { day: DayView; onPress: () => void }) {
+function CalendarCell({
+  day,
+  future,
+  isToday,
+  onPress,
+}: {
+  day: MonthDay;
+  future: boolean;
+  isToday: boolean;
+  onPress: () => void;
+}) {
   const info = statusInfo(day.status);
   const n = Number(day.date.slice(8));
-  const muted = day.future;
+  const code = future
+    ? day.dayType === 'HOLIDAY'
+      ? 'H'
+      : day.dayType === 'WEEKLY_OFF'
+        ? 'WO'
+        : ''
+    : day.code ?? DAY_CODE[day.status] ?? '';
   return (
     <Pressable
       onPress={onPress}
-      disabled={muted && day.dayType === 'WORK'}
-      style={[
-        styles.cell,
-        styles.cellBox,
-        !muted && { backgroundColor: info.bg },
-        day.isToday && styles.today,
-      ]}
+      disabled={future}
+      style={[styles.cell, styles.cellBox, !future && { backgroundColor: info.bg }, isToday && styles.today]}
     >
-      <Text style={[styles.cellNum, muted && { color: colors.textFaint }]}>{n}</Text>
-      <Text style={[styles.cellCode, { color: muted ? colors.textFaint : info.fg }]}>
-        {muted ? (day.dayType === 'HOLIDAY' ? 'H' : day.dayType === 'WEEKLY_OFF' ? 'WO' : day.leave ? 'L' : '') : DAY_CODE[day.status] ?? ''}
-      </Text>
-      {(day.lateMin > 0 || (day.missedPunch && !day.corrected)) && !muted ? (
-        <View style={[styles.flagDot, { backgroundColor: day.missedPunch && !day.corrected ? colors.danger : colors.warning }]} />
+      <Text style={[styles.cellNum, future && { color: colors.textFaint }]}>{n}</Text>
+      <Text style={[styles.cellCode, { color: future ? colors.textFaint : info.fg }]}>{code}</Text>
+      {(day.isLate || day.missedPunch) && !future ? (
+        <View style={[styles.flagDot, { backgroundColor: day.missedPunch ? colors.danger : colors.warning }]} />
       ) : null}
     </Pressable>
   );
@@ -114,45 +131,61 @@ export function CalendarLegend() {
 
 /**
  * The shift as a bar, with worked segments laid over it. Makes "in at 9:36,
- * lunch, back, still in" readable at a glance.
+ * lunch, back, still in" readable at a glance. Without a scheduled window the
+ * bar simply spans the segments.
  */
-export function DayTimeline({ day }: { day: DayView }) {
-  if (!day.shift) return null;
-  const win = shiftWindow(day.date, day.shift);
-  const from = win.start.getTime() - 60 * 60_000;
-  const to = win.end.getTime() + 60 * 60_000;
+export function DayTimeline({
+  date,
+  schedStart,
+  schedEnd,
+  spans,
+  label,
+}: {
+  date: string;
+  /** `HH:MM`, site time. */
+  schedStart?: string | null;
+  schedEnd?: string | null;
+  spans: Span[];
+  label?: string | null;
+}) {
+  const win = shiftWindow(date, schedStart, schedEnd);
+  const nowT = Date.now();
+  const ends = spans.flatMap((s) => [Date.parse(s.in), s.out ? Date.parse(s.out) : nowT]).filter(Number.isFinite);
+  if (!win && !ends.length) return null;
+
+  const lo = Math.min(...(win ? [win.start.getTime()] : []), ...ends);
+  const hi = Math.max(...(win ? [win.end.getTime()] : []), ...ends);
+  const from = lo - 60 * 60_000;
+  const to = hi + 60 * 60_000;
   const span = to - from;
   const pct = (t: number) => `${Math.min(100, Math.max(0, ((t - from) / span) * 100))}%` as const;
-  const nowT = now().getTime();
 
   return (
     <View style={{ gap: spacing.xs }}>
       <View style={styles.track}>
-        <View
-          style={[
-            styles.shiftBand,
-            { left: pct(win.start.getTime()), width: `${((win.end.getTime() - win.start.getTime()) / span) * 100}%` },
-          ]}
-        />
-        {day.segments.map((s, i) => {
+        {win ? (
+          <View
+            style={[
+              styles.shiftBand,
+              { left: pct(win.start.getTime()), width: `${((win.end.getTime() - win.start.getTime()) / span) * 100}%` },
+            ]}
+          />
+        ) : null}
+        {spans.map((s, i) => {
           const a = Date.parse(s.in);
           const b = s.out ? Date.parse(s.out) : Math.min(nowT, to);
           return (
             <View
               key={i}
-              style={[
-                styles.segment,
-                { left: pct(a), width: `${Math.max(1.5, ((b - a) / span) * 100)}%` },
-                !s.out && styles.segmentOpen,
-              ]}
+              style={[styles.segment, { left: pct(a), width: `${Math.max(1.5, ((b - a) / span) * 100)}%` }, !s.out && styles.segmentOpen]}
             />
           );
         })}
       </View>
       <View style={styles.trackLabels}>
-        <Text style={styles.trackLabel}>{isoToTime(win.start.toISOString())}</Text>
-        <Text style={styles.trackLabel}>Shift · {day.shift.name}</Text>
-        <Text style={styles.trackLabel}>{isoToTime(win.end.toISOString())}</Text>
+        <Text style={styles.trackLabel}>{win ? timeLabel(schedStart) : isoToTime(new Date(lo).toISOString())}</Text>
+        {label ? <Text style={styles.trackLabel}>Shift · {label}</Text> : null}
+        <Text style={styles.trackLabel}>{win ? timeLabel(schedEnd) : isoToTime(new Date(hi).toISOString())}</Text>
       </View>
     </View>
   );
@@ -160,36 +193,45 @@ export function DayTimeline({ day }: { day: DayView }) {
 
 /* ------------------------------------------------------------ Punches */
 
-const SOURCE_ICON: Record<Punch['source'], IconName> = {
+const SOURCE_ICON: Record<string, IconName> = {
   TERMINAL: 'scan-outline',
   MOBILE: 'phone-portrait-outline',
   CORRECTION: 'create-outline',
 };
 
+const SOURCE_LABEL: Record<string, string> = {
+  TERMINAL: 'Terminal',
+  MOBILE: 'Iverto app · GPS',
+  CORRECTION: 'Approved correction',
+};
+
 export function PunchList({ punches }: { punches: Punch[] }) {
   let inside = false;
+  const sorted = [...punches].sort((a, b) => a.punchedAt.localeCompare(b.punchedAt));
   return (
     <View style={{ gap: spacing.md }}>
-      {punches.map((p) => {
-        const dir = p.direction === 'UNKNOWN' ? (inside ? 'OUT' : 'IN') : p.direction;
-        inside = dir === 'IN';
+      {sorted.map((p) => {
+        const placed = directionOf(p);
+        const dir = placed ?? (inside ? 'out' : 'in');
+        inside = dir === 'in';
+        const source = (p.source ?? '').toUpperCase();
         return (
           <View key={p.id} style={styles.punch}>
             <IconTile
-              icon={dir === 'IN' ? 'log-in-outline' : 'log-out-outline'}
-              tint={dir === 'IN' ? colors.success : colors.textMuted}
-              bg={dir === 'IN' ? colors.successBg : colors.neutralBg}
+              icon={dir === 'in' ? 'log-in-outline' : 'log-out-outline'}
+              tint={dir === 'in' ? colors.success : colors.textMuted}
+              bg={dir === 'in' ? colors.successBg : colors.neutralBg}
               size={34}
             />
             <View style={{ flex: 1 }}>
               <Text style={styles.punchTime}>
-                {isoToTime(p.at)} <Text style={styles.punchDir}>· {dir === 'IN' ? 'In' : 'Out'}</Text>
+                {isoToTime(p.punchedAt)} <Text style={styles.punchDir}>· {dir === 'in' ? 'In' : 'Out'}</Text>
               </Text>
               <View style={styles.punchMeta}>
-                <Ionicons name={SOURCE_ICON[p.source]} size={12} color={colors.textFaint} />
+                <Ionicons name={SOURCE_ICON[source] ?? 'ellipse-outline'} size={12} color={colors.textFaint} />
                 <Text style={styles.punchDevice} numberOfLines={1}>
-                  {p.device}
-                  {p.direction === 'UNKNOWN' ? ' · two-way gate' : ''}
+                  {p.deviceName ?? SOURCE_LABEL[source] ?? p.source}
+                  {placed ? '' : ' · two-way gate'}
                 </Text>
               </View>
             </View>
@@ -211,12 +253,26 @@ export function Metric({ label, value, tone }: { label: string; value: string; t
   );
 }
 
-export function DayMetrics({ day }: { day: DayView }) {
+export function DayMetrics({
+  firstIn,
+  lastOut,
+  workedMinutes,
+  late,
+  inside,
+}: {
+  /** ISO instants or `HH:MM` site-time strings. */
+  firstIn: string | null;
+  lastOut: string | null;
+  workedMinutes: number | null;
+  late?: boolean;
+  /** Still inside — the last "out" is a break, not the end of the day. */
+  inside?: boolean;
+}) {
   return (
     <View style={styles.metrics}>
-      <Metric label="In" value={day.firstIn ? isoToTime(day.firstIn) : '—'} tone={day.lateMin ? colors.warning : undefined} />
-      <Metric label="Out" value={day.lastOut && !day.segments.some((s) => !s.out) ? isoToTime(day.lastOut) : '—'} />
-      <Metric label="Worked" value={day.workedMin ? formatMinutes(day.workedMin) : '—'} />
+      <Metric label="In" value={timeLabel(firstIn)} tone={late ? colors.warning : undefined} />
+      <Metric label="Out" value={inside ? '—' : timeLabel(lastOut)} />
+      <Metric label="Worked" value={workedMinutes ? formatMinutes(workedMinutes) : '—'} />
     </View>
   );
 }
@@ -225,74 +281,64 @@ export function DayMetrics({ day }: { day: DayView }) {
 
 export function RequestCard({
   request,
-  employee,
+  showEmployee,
   onPress,
   footer,
 }: {
-  request: Request;
-  employee?: Employee;
+  request: Req;
+  /** Manager views lead with who asked. */
+  showEmployee?: boolean;
   onPress?: () => void;
   footer?: React.ReactNode;
 }) {
+  const who = showEmployee ? request.employee?.fullName ?? 'Team member' : null;
+  const days = requestDays(request);
   return (
     <Card onPress={onPress}>
       <View style={styles.reqTop}>
         <IconTile icon={KIND_ICON[request.kind] as IconName} />
         <View style={{ flex: 1 }}>
           <Text style={styles.reqTitle} numberOfLines={1}>
-            {employee ? employee.name : KIND_LABEL[request.kind]}
+            {who ?? KIND_LABEL[request.kind]}
           </Text>
           <Text style={styles.reqSub} numberOfLines={2}>
-            {employee ? `${KIND_LABEL[request.kind]} · ` : ''}
+            {who ? `${KIND_LABEL[request.kind]} · ` : ''}
             {requestSummary(request)}
           </Text>
         </View>
         <StatusPill status={request.status} small />
       </View>
-      {request.days > 0 && request.kind !== 'CORRECTION' ? (
-        <Text style={styles.reqDays}>{daysLabel(request.days)}</Text>
+      {days ? <Text style={styles.reqDays}>{daysLabel(days)}</Text> : null}
+      {request.reason ? (
+        <Text style={styles.reqReason} numberOfLines={2}>
+          “{request.reason}”
+        </Text>
       ) : null}
-      <Text style={styles.reqReason} numberOfLines={2}>
-        “{request.reason}”
-      </Text>
       {footer}
     </Card>
   );
 }
 
 export function MemberRow({
-  employee,
-  day,
+  name,
+  detail,
+  status,
   onPress,
-  showLive = true,
 }: {
-  employee: Employee;
-  day: DayView;
+  name: string;
+  detail: string;
+  status: string;
   onPress?: () => void;
-  showLive?: boolean;
 }) {
-  const status = showLive && day.liveState ? day.liveState : day.status;
-  const detail = day.firstIn
-    ? `In ${isoToTime(day.firstIn)}${day.lateMin ? ` · ${day.lateMin}m late` : ''}${
-        day.lastOut && !day.segments.some((s) => !s.out) ? ` · out ${isoToTime(day.lastOut)}` : ''
-      }`
-    : day.shift
-      ? `${day.shift.name} shift`
-      : day.holidayName ?? 'Off';
-  const initials = employee.name
-    .split(' ')
-    .map((p) => p[0])
-    .slice(0, 2)
-    .join('');
   return (
     <Card onPress={onPress} padded={false}>
       <View style={styles.member}>
         <View style={styles.initials}>
-          <Text style={styles.initialsText}>{initials}</Text>
+          <Text style={styles.initialsText}>{initials(name)}</Text>
         </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.memberName} numberOfLines={1}>
-            {employee.name}
+            {name}
           </Text>
           <Text style={styles.memberSub} numberOfLines={1}>
             {detail}

@@ -6,13 +6,13 @@ import React from 'react';
 import { View, Text, StyleSheet, Animated, Pressable, StatusBar } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { router } from 'expo-router';
 import { Avatar, GlassPanel } from '@/components/ui';
 import { KeyboardAwareScroll } from '@/components/KeyboardAware';
 import { Logo } from '@/components/Logo';
 import { Appear, Stagger, usePop, usePressMotion } from '@/components/motion';
 import { BRAND } from '@/constants/brand';
 import { TAB_BAR_HEIGHT } from '@/components/TabBar';
+import { goBack, useAuth } from '@/lib/auth';
 import { blur, colors, font, radius, shadow, spacing, type } from '@/theme';
 
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
@@ -220,6 +220,7 @@ export function TopBar({
   onRight?: () => void;
 }) {
   const insets = useSafeAreaInsets();
+  const { me } = useAuth();
   const backPress = usePressMotion(0.88);
   const rightPress = usePressMotion(0.88);
 
@@ -230,7 +231,7 @@ export function TopBar({
         {back ? (
           <Animated.View style={backPress.style}>
             <Pressable
-              onPress={() => router.back()}
+              onPress={() => goBack(me)}
               style={styles.iconBtn}
               hitSlop={8}
               {...backPress.pressProps}
